@@ -1,0 +1,18 @@
+# Lite install for low-memory hosting (e.g. shared cPanel with 1 GB RAM).
+# Everything works - accounts, personalisation, recommendations, swap, live costs, visualisation -
+# except photo object detection and wall/floor segmentation, which need PyTorch (~2 GB RAM).
+# The app detects that the models are missing and degrades gracefully.
+fastapi
+uvicorn
+python-multipart
+pymongo
+pydantic-settings
+email-validator
+bcrypt
+pyjwt
+cryptography
+pillow
+numpy
+httpx
+google-auth
+a2wsgi

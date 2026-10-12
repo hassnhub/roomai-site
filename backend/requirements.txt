@@ -1,0 +1,23 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pymongo
+pydantic-settings
+email-validator
+bcrypt
+pyjwt
+cryptography
+pillow
+numpy
+httpx
+# cPanel / Passenger (WSGI) adapter
+a2wsgi
+pytest
+# Object detection (CPU build of PyTorch is enough):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+ultralytics
+# Room segmentation (SegFormer) and connected-component analysis
+transformers
+scipy
+# Google Sign-In token verification
+google-auth

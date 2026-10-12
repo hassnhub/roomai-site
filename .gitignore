@@ -1,0 +1,6 @@
+__pycache__/
+.env
+.storage_key
+storage/
+models/
+*.pyc
