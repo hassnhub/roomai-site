@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     # Where images live: "disk" (storage_dir) or "gridfs" (inside MongoDB, for hosts without persistent disk).
     storage_backend: str = "disk"
 
+    # Database: "mongo" (MongoDB / Atlas) or "sqlite", the built-in document store for hosts whose
+    # firewall blocks outgoing connections to MongoDB. Both serve the same collections and queries.
+    db_backend: str = "mongo"
+    sqlite_path: Path = BASE_DIR / "data" / "roomai.sqlite3"
     mongo_uri: str = "mongodb://localhost:27017"
     mongo_db: str = "roomai"
 
@@ -66,6 +70,10 @@ class Settings(BaseSettings):
             problems.append("STORAGE_KEY must be set (a Fernet key) so photos stay decryptable across deployments")
         if self.storage_backend not in ("disk", "gridfs"):
             problems.append("STORAGE_BACKEND must be 'disk' or 'gridfs'")
+        if self.db_backend not in ("mongo", "sqlite"):
+            problems.append("DB_BACKEND must be 'mongo' or 'sqlite'")
+        if self.db_backend == "sqlite" and self.storage_backend == "gridfs":
+            problems.append("STORAGE_BACKEND=gridfs needs MongoDB; use 'disk' with DB_BACKEND=sqlite")
         if self.base_path and (not self.base_path.startswith("/") or self.base_path.endswith("/")):
             problems.append("BASE_PATH must start with '/' and have no trailing slash, e.g. /roomai")
         return problems

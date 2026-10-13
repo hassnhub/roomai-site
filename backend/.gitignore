@@ -6,3 +6,4 @@ storage/
 models/
 *.pt
 .pytest_cache/
+data/

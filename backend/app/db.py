@@ -1,4 +1,4 @@
-"""MongoDB connection helpers."""
+"""Database connection helpers: MongoDB, or the built-in SQLite document store (DB_BACKEND=sqlite)."""
 from functools import lru_cache
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
@@ -12,7 +12,16 @@ def get_client() -> MongoClient:
     return MongoClient(get_settings().mongo_uri, serverSelectionTimeoutMS=5000, tz_aware=True)
 
 
+@lru_cache
+def _docstore():
+    from .docstore import DocStore
+
+    return DocStore(get_settings().sqlite_path)
+
+
 def get_db() -> Database:
+    if get_settings().db_backend == "sqlite":
+        return _docstore()
     return get_client()[get_settings().mongo_db]
 
 

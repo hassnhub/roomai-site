@@ -8,6 +8,10 @@ os.environ["MONGO_DB"] = "roomai_test"
 os.environ["STORAGE_DIR"] = _tmp
 os.environ["VISUALISER"] = "local"
 os.environ["STORAGE_KEY"] = "ZmFrZS10ZXN0LWtleS1mb3ItdW5pdC10ZXN0cy0xMjM="
+# DB_BACKEND=sqlite runs the whole suite against the built-in document store instead of MongoDB.
+SQLITE = os.environ.get("DB_BACKEND") == "sqlite"
+if SQLITE:
+    os.environ["SQLITE_PATH"] = str(Path(_tmp) / "roomai_test.sqlite3")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -23,14 +27,19 @@ def products():
     return generate_products()
 
 
+def _drop_test_database():
+    if not SQLITE:  # the SQLite file lives in a fresh temporary folder
+        get_client().drop_database("roomai_test")
+
+
 @pytest.fixture(scope="session")
 def client():
-    get_client().drop_database("roomai_test")
+    _drop_test_database()
     from app.main import app
 
     with TestClient(app) as c:
         yield c
-    get_client().drop_database("roomai_test")
+    _drop_test_database()
 
 
 @pytest.fixture(scope="session")
