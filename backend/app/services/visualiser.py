@@ -46,19 +46,23 @@ def build_prompt(room_type: str, style: str, scheme: str, items: list[dict]) -> 
         f"{i['colour_name'].lower()} {i['material']} {CATEGORIES[i['category']].lower()}" for i in items[:6]
     )
     prompt = (
-        f"A beautifully redesigned {STYLES[style]['label']} {ROOM_TYPES[room_type].lower()} interior, "
-        f"{scheme_label} colour palette, featuring {key_items}. Photorealistic interior design photography, "
-        f"natural daylight, balanced composition, high detail, magazine quality."
+        f"The same {ROOM_TYPES[room_type].lower()} completely refurnished in {STYLES[style]['label']} style "
+        f"with all-new furniture and décor: {key_items}. {scheme_label.capitalize()} colour palette on the walls "
+        f"and soft furnishings. Same walls, windows, doors and camera angle. Photorealistic interior design "
+        f"photography, natural daylight, balanced composition, high detail, magazine quality."
     )
-    negative = "people, text, watermark, blurry, distorted furniture, cluttered, low quality, cartoon, deformed"
+    negative = ("people, text, watermark, blurry, distorted furniture, cluttered, low quality, cartoon, deformed, "
+                "old worn furniture, mess, extra windows, warped walls")
     return prompt, negative
 
 
 def render(image: Image.Image, room_type: str, style: str, scheme: str, option: dict,
-           label_map: np.ndarray | None = None, detections: list[dict] | None = None) -> tuple[bytes, str, str]:
-    """Returns (jpeg_bytes, provider_used, prompt). Falls back to local preview if a provider fails."""
+           label_map: np.ndarray | None = None, detections: list[dict] | None = None,
+           provider: str | None = None) -> tuple[bytes, str, str]:
+    """Returns (jpeg_bytes, provider_used, prompt). Falls back to local preview if a provider fails.
+    ``provider="local"`` forces the instant offline preview even when a cloud provider is configured."""
     prompt, negative = build_prompt(room_type, style, scheme, option["items"])
-    provider = active_provider()
+    provider = provider or active_provider()
     try:
         if provider == "stability":
             return _stability(image, prompt, negative), "stability", prompt
@@ -76,7 +80,10 @@ def _stability(image: Image.Image, prompt: str, negative: str) -> bytes:
         "https://api.stability.ai/v2beta/stable-image/control/structure",
         headers={"Authorization": f"Bearer {s.stability_api_key}", "Accept": "image/*"},
         files={"image": ("room.jpg", to_jpeg_bytes(image), "image/jpeg")},
-        data={"prompt": prompt, "negative_prompt": negative, "control_strength": "0.75", "output_format": "jpeg"},
+        # Lower strength gives the model freedom to replace the furniture; the room's walls, windows
+        # and perspective still follow the photo's structure.
+        data={"prompt": prompt, "negative_prompt": negative, "control_strength": str(s.stability_control_strength),
+              "output_format": "jpeg"},
         timeout=120,
     )
     if resp.status_code != 200:

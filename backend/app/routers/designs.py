@@ -68,13 +68,13 @@ def _load_inputs(design: dict, uid: str) -> tuple[Image.Image, np.ndarray | None
     return img, label_map
 
 
-def _render_option(design: dict, uid: str, index: int, img=None, label_map=None) -> dict:
+def _render_option(design: dict, uid: str, index: int, img=None, label_map=None, provider: str | None = None) -> dict:
     if img is None:
         img, label_map = _load_inputs(design, uid)
     option = design["options"][index]
     jpeg, provider, prompt = visualiser.render(
         img, design["room_type"], design["preferences"]["style"], design["preferences"]["scheme"], option, label_map,
-        design.get("detected_items"))
+        design.get("detected_items"), provider=provider)
     return {
         "image_id": storage.save_image(uid, jpeg, "render"),
         "option_index": index, "option_title": option["title"],
@@ -82,8 +82,9 @@ def _render_option(design: dict, uid: str, index: int, img=None, label_map=None)
     }
 
 
-def _replace_renders(design: dict, uid: str, indices: list[int]) -> list[dict]:
-    """Re-render the given options, deleting their previous renders."""
+def _replace_renders(design: dict, uid: str, indices: list[int], provider: str | None = "local") -> list[dict]:
+    """Re-render the given options, deleting their previous renders. Defaults to the instant offline preview;
+    the AI redesign (new furniture) is generated only when the user asks for it."""
     keep = []
     for r in design.get("renders", []):
         if r["option_index"] in indices:
@@ -91,7 +92,7 @@ def _replace_renders(design: dict, uid: str, indices: list[int]) -> list[dict]:
         else:
             keep.append(r)
     img, label_map = _load_inputs(design, uid)
-    return keep + [_render_option(design, uid, i, img, label_map) for i in indices]
+    return keep + [_render_option(design, uid, i, img, label_map, provider) for i in indices]
 
 
 # --- Endpoints ---------------------------------------------------------------------------------
@@ -135,10 +136,9 @@ def _create(img: Image.Image, prefs: PreferencesIn, user: dict) -> dict:
         "renders": [],
         "favourite": False,
     }
-    # The offline renderer takes about a second, so all three options are visualised straight away.
-    # Paid cloud providers are only called when the user asks.
-    if visualiser.active_provider() == "local":
-        design["renders"] = [_render_option(design, uid, i, img, label_map) for i in range(len(options))]
+    # The offline renderer takes about a second, so all three options get an instant preview.
+    # The cloud AI redesign (which replaces the furniture) is paid per image, so it runs only on request.
+    design["renders"] = [_render_option(design, uid, i, img, label_map, "local") for i in range(len(options))]
     design["_id"] = get_db().designs.insert_one(design).inserted_id
     return serialize(design)
 
@@ -175,8 +175,7 @@ def update_design(design_id: str, body: DesignUpdateIn, user: dict = Depends(cur
             "preferences": p, "room_type": room_type, "room_type_source": source, "options": options,
             "detected_items": map_to_categories(design["analysis"]["detections"], room_type),
         })
-        if visualiser.active_provider() == "local":
-            changes["renders"] = _replace_renders({**design, **changes}, str(user["_id"]), list(range(len(options))))
+        changes["renders"] = _replace_renders({**design, **changes}, str(user["_id"]), list(range(len(options))))
     get_db().designs.update_one({"_id": design["_id"]}, {"$set": changes})
     return serialize({**design, **changes})
 
@@ -197,11 +196,13 @@ def preview_design(design_id: str, body: PreviewIn, user: dict = Depends(current
 @router.post("/{design_id}/render")
 def render_design(design_id: str, body: RenderIn, user: dict = Depends(current_user)):
     design = _get_owned(design_id, user)
-    render = _render_option(design, str(user["_id"]), body.option_index)
-    get_db().designs.update_one({"_id": design["_id"]},
-                                {"$push": {"renders": render}, "$set": {"updated_at": render["created_at"]}})
-    design.setdefault("renders", []).append(render)
-    return serialize(design)
+    if body.option_index >= len(design["options"]):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Option not found")
+    # Uses the configured AI provider (new furniture) and replaces this option's previous image.
+    renders = _replace_renders(design, str(user["_id"]), [body.option_index], provider=None)
+    changes = {"renders": renders, "updated_at": datetime.now(timezone.utc)}
+    get_db().designs.update_one({"_id": design["_id"]}, {"$set": changes})
+    return serialize({**design, **changes})
 
 
 @router.get("/{design_id}/options/{index}/alternatives")
@@ -238,8 +239,7 @@ def swap_item(design_id: str, index: int, body: SwapIn, user: dict = Depends(cur
     option["items"][pos] = replacement
     get_recommender().summarize(option, prefs)
     changes = {"options": design["options"], "updated_at": datetime.now(timezone.utc)}
-    if visualiser.active_provider() == "local":
-        changes["renders"] = _replace_renders(design, str(user["_id"]), [index])
+    changes["renders"] = _replace_renders(design, str(user["_id"]), [index])
     get_db().designs.update_one({"_id": design["_id"]}, {"$set": changes})
     return serialize({**design, **changes})
 
