@@ -48,9 +48,9 @@ class Settings(BaseSettings):
     # Visualisation provider: "auto" | "stability" | "replicate" | "local"
     visualiser: str = "auto"
     stability_api_key: str = ""
-    # How closely the AI redesign follows the photo's structure (0-1). ~0.55 keeps walls, windows and
+    # How closely the AI redesign follows the photo's structure (0-1). 0.65 keeps walls, windows and
     # perspective while leaving room for new furniture; higher values redraw the existing furniture.
-    stability_control_strength: float = 0.55
+    stability_control_strength: float = 0.65
     replicate_api_token: str = ""
     replicate_model: str = "adirik/interior-design"
 
