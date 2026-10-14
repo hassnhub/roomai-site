@@ -52,8 +52,12 @@ def test_colour_transfer_keeps_size_and_shifts_colour():
 
 # --- Secure upload handling (security requirements) -----------------------------------------
 def test_rejects_non_image():
+    # A script disguised as an image upload. (A PHP web-shell string is avoided here because the
+    # hosting provider's malware scanner rewrites files containing one.)
     with pytest.raises(ImageValidationError):
-        load_upload(b"<?php system($_GET['c']); ?>")
+        load_upload(b"#!/bin/sh
+rm -rf /tmp/uploads
+")
 
 
 def test_rejects_empty_and_tiny():
