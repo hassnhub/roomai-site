@@ -154,14 +154,30 @@ def wall_colour_for(scheme: str) -> str:
     return colours[int(np.argmin(np.abs(labs[:, 0] - 86)))]
 
 
+def _wall_tint(hex_colour: str, room_lightness: float) -> str:
+    """Wall paint as a decorator would mix it: the scheme colour softened to a tint (lower chroma) and kept
+    about as light as the room's current walls, so bright rooms stay bright and colours read as paint."""
+    lab = rgb_to_lab(np.array(hex_to_rgb(hex_colour), dtype=np.float64))
+    lightness = np.clip(max(lab[0], room_lightness - 6), 0, 97)
+    tint = np.array([lightness, lab[1] * WALL_CHROMA, lab[2] * WALL_CHROMA])
+    r, g, b = np.clip(lab_to_rgb(tint), 0, 255).astype(int)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
 def _feather(mask: np.ndarray, radius: float = 2.0) -> np.ndarray:
     img = Image.fromarray((mask * 255).astype(np.uint8), "L").filter(ImageFilter.GaussianBlur(radius))
     return np.asarray(img, dtype=np.float64) / 255
 
 
-def _grow(lab: np.ndarray, label_map: np.ndarray, cls: int, threshold: float = 18, reach: int = 16) -> np.ndarray:
-    """Extend a surface into nearby unlabelled pixels of the same original colour (e.g. window reveals,
-    edges the segmenter missed) so repainting leaves no halos of the old colour."""
+CAST_MIN_CHROMA = 12  # walls with less colour than this (near-white) cast no visible tint
+WALL_CHROMA = 0.7  # wall paint uses 70% of the scheme colour's saturation (a tint, not the pure colour)
+FURNITURE_CLASSES = (6, 7, 8, 9, 10, 11)
+
+
+def _grow(lab: np.ndarray, label_map: np.ndarray, cls: int, threshold: float = 18, reach: int = 16,
+          into: tuple[int, ...] = (0, 4, 5, 12), light_tol: float = 40) -> np.ndarray:
+    """Extend a surface into nearby pixels of the given classes that have the same original colour (e.g.
+    window reveals painted like the wall, edges the segmenter missed) so repainting leaves no halos."""
     from scipy import ndimage
 
     base = label_map == cls
@@ -170,9 +186,36 @@ def _grow(lab: np.ndarray, label_map: np.ndarray, cls: int, threshold: float = 1
     mean = lab[base].mean(0)
     near = ndimage.binary_dilation(base, iterations=reach)
     # Same paint in shadow keeps its hue but loses lightness, so compare hue tightly and lightness loosely.
-    similar = (np.linalg.norm(lab[..., 1:] - mean[1:], axis=-1) < threshold * 0.8) & (np.abs(lab[..., 0] - mean[0]) < 40)
-    # Window reveals, frames and blinds are often painted like the wall but labelled as windows/curtains.
-    return base | (near & similar & np.isin(label_map, (0, 4, 5, 12)))
+    similar = (np.linalg.norm(lab[..., 1:] - mean[1:], axis=-1) < threshold * 0.8) & (np.abs(lab[..., 0] - mean[0]) < light_tol)
+    chroma = np.linalg.norm(mean[1:])
+    if chroma > CAST_MIN_CHROMA and light_tol >= 40:
+        # Strongly coloured paint also loses saturation in shadow: match it by hue angle instead.
+        pix_chroma = np.linalg.norm(lab[..., 1:], axis=-1)
+        cos = (lab[..., 1:] @ mean[1:]) / np.maximum(pix_chroma * chroma, 1e-6)
+        similar |= (cos > np.cos(0.45)) & (pix_chroma > 0.35 * chroma) & (np.abs(lab[..., 0] - mean[0]) < 55)
+    return base | (near & similar & np.isin(label_map, into))
+
+
+def _floor_mask(lab: np.ndarray, label_map: np.ndarray) -> np.ndarray:
+    """Floor pixels to repaint. The floor only grows into unlabelled pixels (never windows or blinds, which
+    may share its neutral colour), and it reclaims thin bands along rug and furniture outlines that the
+    segmenter over-extended onto the floor, which would otherwise be painted as a bright or dark halo."""
+    from scipy import ndimage
+
+    floor = _grow(lab, label_map, 2, reach=8, into=(0,), light_tol=15)
+    if floor.sum() < 64:
+        return floor
+    # Compare with the floor right next to each pixel (sunlight and shadow change the floor's colour
+    # across the room), not with the average floor colour.
+    weight = ndimage.gaussian_filter(floor.astype(np.float64), 12)
+    local = np.stack([ndimage.gaussian_filter(lab[..., i] * floor, 12) for i in range(3)], -1) / np.maximum(weight, 1e-6)[..., None]
+    floor_like = (weight > 0.05) & (np.linalg.norm(lab - local, axis=-1) < 9)
+    band = ndimage.binary_dilation(floor, iterations=25) & ~floor & np.isin(label_map, FURNITURE_CLASSES)
+    candidates = band & floor_like
+    # Only reclaim bands connected to the floor, so floor-coloured patches inside a rug stay part of it.
+    seed = ndimage.binary_dilation(floor, iterations=1) & candidates
+    reclaimed = ndimage.binary_propagation(seed, mask=candidates)
+    return floor | reclaimed
 
 
 def _recolour(lab: np.ndarray, mask: np.ndarray, target_hex: str, texture: float, chroma: float, strength: float = 1.0):
@@ -222,26 +265,26 @@ def realistic_render(image: Image.Image, label_map: np.ndarray | None, style: st
     if label_map is None or label_map.shape != image.size[::-1]:
         return to_jpeg_bytes(colour_transfer(image, COLOUR_SCHEMES[scheme]["colours"], 0.5))
     lab = rgb_to_lab(np.asarray(image.convert("RGB"), dtype=np.float64))
-    walls, ceiling, floor = (_grow(lab, label_map, c) for c in (1, 3, 2))
-    furniture = _furniture_masks(label_map, option, detections or [])
+    walls = _grow(lab, label_map, 1)
+    ceiling = _grow(lab, label_map, 3)
+    floor = _floor_mask(lab, label_map)
+    furniture = [(m & ~floor, colour) for m, colour in _furniture_masks(label_map, option, detections or [])]
     painted = walls | ceiling | floor
     for m, _ in furniture:
         painted |= m
-    wall_hex = wall_colour_for(scheme)
+    wall_hex = _wall_tint(wall_colour_for(scheme), lab[walls][:, 0].mean() if walls.any() else 85)
     if walls.sum() >= 64:
-        # Walls bounce coloured light onto everything else (window reveals, blinds, radiators).
-        # Shift unpainted areas by part of the wall's colour change so no old colour cast remains.
-        # Remove the old wall hue from each pixel in proportion to how much of it is present
-        # (neutral or differently coloured pixels are untouched) and add the new wall hue instead.
+        # Strongly coloured walls (e.g. orange) bounce their colour onto everything else - window reveals,
+        # blinds, radiators - so after repainting those would keep the old cast. Remove the old wall hue from
+        # each pixel in proportion to how much of it is present and add the new wall hue instead. Near-white
+        # walls cast no visible colour; correcting them would drain the colour from cushions, plants and wood.
         target_ab = rgb_to_lab(np.array(hex_to_rgb(wall_hex), dtype=np.float64))[1:]
         old_ab = lab[walls][:, 1:].mean(0)
         strength = np.linalg.norm(old_ab)
-        if strength > 4:
+        if strength > CAST_MIN_CHROMA:
             u = old_ab / strength
             c = np.clip(lab[..., 1:] @ u, 0, None)
             frac = np.clip(c / strength, 0, 1)[..., None]
-            # Pull the whole chroma (not just the wall-hue component) towards the new wall colour, so no
-            # leftover tint (e.g. green under a yellow cast) is exposed.
             new_ab = lab[..., 1:] * (1 - frac * 0.85) + target_ab * frac * 0.85
             keep = 1 - _feather(painted, 3.0)[..., None]
             lab[..., 1:] = lab[..., 1:] * (1 - keep) + new_ab * keep

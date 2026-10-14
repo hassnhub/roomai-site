@@ -137,3 +137,74 @@ def test_realistic_render_repaints_walls_only_where_labelled():
     wall_px = rgb_to_hex(out.getpixel((100, 20)))
     assert delta_e(wall_px, wall_colour_for("neutral")) < 8
     assert delta_e(rgb_to_hex(out.getpixel((100, 90))), "#282828") > 20  # floor repainted too
+
+
+def _render(img, label_map, style, scheme, option=None, detections=None):
+    import io as _io
+
+    from app.services.visualiser import realistic_render
+    return Image.open(_io.BytesIO(realistic_render(img, label_map, style, scheme, option or {"items": []}, detections)))
+
+
+def test_white_walls_do_not_drain_colour_from_other_objects():
+    """Regression: repainting near-white walls once pulled cushions and plants towards the wall colour."""
+    import numpy as np
+
+    from app.services.colours import delta_e, rgb_to_hex
+
+    img = Image.new("RGB", (200, 120), (246, 242, 234))   # near-white wall
+    img.paste((200, 200, 196), (0, 80, 200, 120))         # light grey floor
+    img.paste((222, 160, 40), (90, 30, 120, 60))          # mustard cushion on the wall area
+    label_map = np.zeros((120, 200), dtype=np.uint8)
+    label_map[:80] = 1
+    label_map[30:60, 90:120] = 0                          # the cushion is not wall
+    label_map[80:] = 2
+    out = _render(img, label_map, "traditional", "pastel")
+    assert delta_e(rgb_to_hex(out.getpixel((105, 45))), "#DEA028") < 6
+    assert delta_e(rgb_to_hex(out.getpixel((40, 20))), "#F6F2EA") > 3  # the wall itself was repainted
+
+
+def test_wall_paint_is_a_soft_tint_of_the_scheme_colour():
+    import numpy as np
+
+    from app.services.colours import hex_to_rgb, rgb_to_lab
+    from app.services.visualiser import _wall_tint, wall_colour_for
+
+    pure = rgb_to_lab(np.array(hex_to_rgb(wall_colour_for("pastel")), dtype=float))
+    tint = rgb_to_lab(np.array(hex_to_rgb(_wall_tint(wall_colour_for("pastel"), 95)), dtype=float))
+    assert np.linalg.norm(tint[1:]) < np.linalg.norm(pure[1:]) * 0.8   # less saturated
+    assert tint[0] >= 88                                               # bright room stays bright
+
+
+def test_oversized_rug_outline_is_returned_to_the_floor():
+    """Regression: the segmenter's rug outline spilled onto the floor and was painted as a bright halo."""
+    import numpy as np
+
+    from app.services.colours import delta_e, rgb_to_hex
+
+    img = Image.new("RGB", (200, 140), (240, 238, 232))
+    img.paste((200, 200, 196), (0, 60, 200, 140))         # floor
+    img.paste((120, 80, 50), (70, 90, 130, 120))          # real rug (dark)
+    label_map = np.zeros((140, 200), dtype=np.uint8)
+    label_map[:60] = 1
+    label_map[60:] = 2
+    label_map[80:130, 55:145] = 11                        # rug label overshoots by ~10 px
+    option = {"items": [{"category": "rug", "colour_hex": "#EFE6D2", "line_total": 100}]}
+    out = _render(img, label_map, "traditional", "neutral", option)
+    halo, floor = rgb_to_hex(out.getpixel((60, 125))), rgb_to_hex(out.getpixel((20, 125)))
+    assert delta_e(halo, floor) < 10                       # overshoot painted like the floor
+    assert delta_e(rgb_to_hex(out.getpixel((100, 105))), floor) > 15   # the real rug is still a rug
+
+
+def test_floor_never_spreads_into_windows():
+    import numpy as np
+
+    from app.services.colours import rgb_to_lab
+    from app.services.visualiser import _floor_mask
+
+    img = Image.new("RGB", (100, 100), (205, 205, 200))   # window blinds and floor look alike
+    label_map = np.zeros((100, 100), dtype=np.uint8)
+    label_map[:50] = 4                                    # window
+    label_map[50:] = 2                                    # floor
+    lab = rgb_to_lab(np.asarray(img, dtype=float))
+    assert not _floor_mask(lab, label_map)[:50].any()
