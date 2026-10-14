@@ -196,6 +196,35 @@ def _grow(lab: np.ndarray, label_map: np.ndarray, cls: int, threshold: float = 1
     return base | (near & similar & np.isin(label_map, into))
 
 
+def _wall_mask(lab: np.ndarray, label_map: np.ndarray) -> np.ndarray:
+    """Wall pixels to repaint.
+
+    Strongly coloured walls (e.g. orange) tint their window reveals and frames, so those are grown into
+    pixel by pixel. Light walls are handled per region instead: a small region the segmenter labelled as a
+    window, curtain or picture that mostly looks like the wall (typically a sunlit or shaded strip of
+    wall) becomes wall as a whole, while real blinds and windows are left alone as a whole - painting
+    part of a region produces patches."""
+    from scipy import ndimage
+
+    base = label_map == 1
+    if base.sum() < 64:
+        return base
+    mean = lab[base].mean(0)
+    if np.linalg.norm(mean[1:]) > CAST_MIN_CHROMA:
+        return _grow(lab, label_map, 1)
+    walls = _grow(lab, label_map, 1, into=(0,))
+    wall_like = (np.linalg.norm(lab[..., 1:] - mean[1:], axis=-1) < 10) & (np.abs(lab[..., 0] - mean[0]) < 15)
+    touching = ndimage.binary_dilation(walls, iterations=2)
+    regions, n = ndimage.label(np.isin(label_map, (0, 4, 5, 12, 15)) & ~walls)
+    max_area = label_map.size * 0.025
+    for i in range(1, n + 1):
+        region = regions == i
+        area = region.sum()
+        if area <= max_area and (region & touching).any() and wall_like[region].mean() >= 0.6:
+            walls |= region
+    return walls
+
+
 def _floor_mask(lab: np.ndarray, label_map: np.ndarray) -> np.ndarray:
     """Floor pixels to repaint. The floor only grows into unlabelled pixels (never windows or blinds, which
     may share its neutral colour), and it reclaims thin bands along rug and furniture outlines that the
@@ -265,7 +294,7 @@ def realistic_render(image: Image.Image, label_map: np.ndarray | None, style: st
     if label_map is None or label_map.shape != image.size[::-1]:
         return to_jpeg_bytes(colour_transfer(image, COLOUR_SCHEMES[scheme]["colours"], 0.5))
     lab = rgb_to_lab(np.asarray(image.convert("RGB"), dtype=np.float64))
-    walls = _grow(lab, label_map, 1)
+    walls = _wall_mask(lab, label_map)
     ceiling = _grow(lab, label_map, 3)
     floor = _floor_mask(lab, label_map)
     furniture = [(m & ~floor, colour) for m, colour in _furniture_masks(label_map, option, detections or [])]
