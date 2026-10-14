@@ -68,6 +68,8 @@ class Settings(BaseSettings):
             problems.append("JWT_SECRET must be set to a random value of at least 32 characters")
         if not self.storage_key.strip():
             problems.append("STORAGE_KEY must be set (a Fernet key) so photos stay decryptable across deployments")
+        elif not _valid_fernet_key(self.storage_key.strip()):
+            problems.append("STORAGE_KEY is not a valid Fernet key (44 characters ending in '='); was it copied completely?")
         if self.storage_backend not in ("disk", "gridfs"):
             problems.append("STORAGE_BACKEND must be 'disk' or 'gridfs'")
         if self.db_backend not in ("mongo", "sqlite"):
@@ -77,6 +79,16 @@ class Settings(BaseSettings):
         if self.base_path and (not self.base_path.startswith("/") or self.base_path.endswith("/")):
             problems.append("BASE_PATH must start with '/' and have no trailing slash, e.g. /roomai")
         return problems
+
+
+def _valid_fernet_key(key: str) -> bool:
+    from cryptography.fernet import Fernet
+
+    try:
+        Fernet(key.encode())
+        return True
+    except ValueError:
+        return False
 
 
 @lru_cache

@@ -41,5 +41,8 @@ def test_production_safety_checks():
                     storage_key="ZmFrZS10ZXN0LWtleS1mb3ItdW5pdC10ZXN0cy0xMjM=", base_path="/roomai")
     assert good.production_problems() == []
     assert Settings(base_path="roomai/").production_problems()
+    truncated = Settings(environment="production", jwt_secret="x" * 48,
+                         storage_key="ZmFrZS10ZXN0LWtleS1mb3ItdW5pdC10ZXN0cy0xMjM")  # final "=" lost when copying
+    assert any("not a valid Fernet key" in p for p in truncated.production_problems())
     assert Settings(db_backend="sqlite", storage_backend="gridfs").production_problems()
     assert Settings(db_backend="postgres").production_problems()
