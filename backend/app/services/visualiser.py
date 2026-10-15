@@ -215,12 +215,19 @@ def _wall_mask(lab: np.ndarray, label_map: np.ndarray) -> np.ndarray:
     walls = _grow(lab, label_map, 1, into=(0,))
     wall_like = (np.linalg.norm(lab[..., 1:] - mean[1:], axis=-1) < 10) & (np.abs(lab[..., 0] - mean[0]) < 15)
     touching = ndimage.binary_dilation(walls, iterations=2)
+    # Roughness (mean lightness change between neighbouring pixels) separates a smooth sunlit or shaded
+    # strip of wall from striped blinds and framed windows of the same colour.
+    light = lab[..., 0]
+    rough = np.abs(np.diff(light, axis=0, prepend=light[:1])) + np.abs(np.diff(light, axis=1, prepend=light[:, :1]))
+    wall_rough = rough[base].mean()
     regions, n = ndimage.label(np.isin(label_map, (0, 4, 5, 12, 15)) & ~walls)
-    max_area = label_map.size * 0.025
+    small, larger = label_map.size * 0.025, label_map.size * 0.05
     for i in range(1, n + 1):
         region = regions == i
         area = region.sum()
-        if area <= max_area and (region & touching).any() and wall_like[region].mean() >= 0.6:
+        if not ((region & touching).any() and wall_like[region].mean() >= 0.6):
+            continue
+        if area <= small or (area <= larger and rough[region].mean() <= wall_rough):
             walls |= region
     return walls
 

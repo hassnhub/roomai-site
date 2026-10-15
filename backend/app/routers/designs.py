@@ -13,9 +13,9 @@ from starlette.concurrency import run_in_threadpool
 from .. import storage
 from ..db import get_db
 from ..domain import ROOM_TYPES
-from ..schemas import DesignUpdateIn, PreferencesIn, PreviewIn, RenderIn, SwapIn
+from ..schemas import DesignUpdateIn, EditsIn, PreferencesIn, PreviewIn, RenderIn, SwapIn
 from ..security import current_user
-from ..services import visualiser
+from ..services import room_editor, visualiser
 from ..services.detection import map_to_categories
 from ..services.imaging import ImageValidationError, load_upload, to_jpeg_bytes
 from ..services.pipeline import analyse_image, get_recommender, prefs_for, recommend_for
@@ -31,6 +31,8 @@ def serialize(d: dict) -> dict:
         if key in out:
             out[key] = out[key].isoformat()
     out["renders"] = [{**r, "created_at": r["created_at"].isoformat()} for r in d.get("renders", [])]
+    if d.get("custom"):
+        out["custom"] = {**d["custom"], "created_at": d["custom"]["created_at"].isoformat()}
     return out
 
 
@@ -248,6 +250,8 @@ def swap_item(design_id: str, index: int, body: SwapIn, user: dict = Depends(cur
 def get_image(design_id: str, image_id: str, user: dict = Depends(current_user)):
     design = _get_owned(design_id, user)
     allowed = {design["image_id"], *(r["image_id"] for r in design.get("renders", []))}
+    if design.get("custom"):
+        allowed.add(design["custom"]["image_id"])
     if image_id not in allowed:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Image not found")
     data = storage.load_image(str(user["_id"]), image_id)
@@ -272,8 +276,83 @@ def get_overlay(design_id: str, user: dict = Depends(current_user)):
 def delete_design(design_id: str, user: dict = Depends(current_user)):
     design = _get_owned(design_id, user)
     uid = str(user["_id"])
-    for file_id in [design["image_id"], design.get("seg_id"), *(r["image_id"] for r in design.get("renders", []))]:
+    custom = [design["custom"]["image_id"]] if design.get("custom") else []
+    for file_id in [design["image_id"], design.get("seg_id"), *(r["image_id"] for r in design.get("renders", [])), *custom]:
         if file_id:
             storage.delete_image(uid, file_id)
     get_db().designs.delete_one({"_id": design["_id"]})
     return Response(status_code=204)
+
+
+# --- Edit Room: tap a region of the photo and recolour it ----------------------------------------------
+_REGION_CACHE: dict[tuple[str, str], tuple] = {}
+
+
+def _regions(design: dict, uid: str):
+    """(image, index_map, regions) for a design, cached per design and segmentation."""
+    key = (str(design["_id"]), design.get("seg_id") or "")
+    if key not in _REGION_CACHE:
+        img, label_map = _load_inputs(design, uid)
+        if label_map is None or label_map.shape != img.size[::-1]:
+            raise HTTPException(status.HTTP_409_CONFLICT, "This design has no room segmentation, so it cannot be edited")
+        index, regions = room_editor.build_regions(img, label_map)
+        if len(_REGION_CACHE) >= 16:
+            _REGION_CACHE.pop(next(iter(_REGION_CACHE)))
+        _REGION_CACHE[key] = (img, index, regions)
+    return _REGION_CACHE[key]
+
+
+@router.get("/{design_id}/regions")
+def list_regions(design_id: str, user: dict = Depends(current_user)):
+    design = _get_owned(design_id, user)
+    _, index, regions = _regions(design, str(user["_id"]))
+    h, w = index.shape
+    return {"width": w, "height": h, "regions": regions, "floor_finishes": room_editor.FLOOR_FINISHES}
+
+
+@router.get("/{design_id}/regions.png")
+def region_map(design_id: str, user: dict = Depends(current_user)):
+    design = _get_owned(design_id, user)
+    _, index, _ = _regions(design, str(user["_id"]))
+    return Response(room_editor.index_png(index), media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+
+
+def _edited(design: dict, uid: str, body: EditsIn) -> bytes:
+    img, index, regions = _regions(design, uid)
+    try:
+        return room_editor.apply_edits(img, index, regions, [e.model_dump() for e in body.edits])
+    except room_editor.EditError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
+
+
+@router.post("/{design_id}/edit/preview")
+def preview_edit(design_id: str, body: EditsIn, user: dict = Depends(current_user)):
+    """Instant preview of the edits; nothing is stored."""
+    design = _get_owned(design_id, user)
+    return Response(_edited(design, str(user["_id"]), body), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@router.post("/{design_id}/edit")
+def save_edit(design_id: str, body: EditsIn, user: dict = Depends(current_user)):
+    """Saves the edited photo with the design, replacing any earlier saved edit."""
+    design = _get_owned(design_id, user)
+    uid = str(user["_id"])
+    if not body.edits:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Make at least one change before saving")
+    jpeg = _edited(design, uid, body)
+    if design.get("custom"):
+        storage.delete_image(uid, design["custom"]["image_id"])
+    now = datetime.now(timezone.utc)
+    custom = {"image_id": storage.save_image(uid, jpeg, "edit"), "edits": [e.model_dump() for e in body.edits], "created_at": now}
+    get_db().designs.update_one({"_id": design["_id"]}, {"$set": {"custom": custom, "updated_at": now}})
+    return serialize({**design, "custom": custom, "updated_at": now})
+
+
+@router.delete("/{design_id}/edit")
+def delete_edit(design_id: str, user: dict = Depends(current_user)):
+    design = _get_owned(design_id, user)
+    if design.get("custom"):
+        storage.delete_image(str(user["_id"]), design["custom"]["image_id"])
+        get_db().designs.update_one({"_id": design["_id"]}, {"$unset": {"custom": ""}})
+        design.pop("custom")
+    return serialize(design)

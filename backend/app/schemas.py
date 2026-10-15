@@ -97,6 +97,15 @@ class SwapIn(BaseModel):
     sku: str = Field(min_length=1, max_length=40)
 
 
+class EditIn(BaseModel):
+    region: str = Field(pattern=r"^[a-z0-9-]{1,40}$")
+    colour: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+
+
+class EditsIn(BaseModel):
+    edits: list[EditIn] = Field(default_factory=list, max_length=30)
+
+
 class GoogleIn(BaseModel):
     credential: str = Field(min_length=20, max_length=4096)
 
