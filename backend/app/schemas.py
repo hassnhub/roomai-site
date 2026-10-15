@@ -106,6 +106,13 @@ class EditsIn(BaseModel):
     edits: list[EditIn] = Field(default_factory=list, max_length=30)
 
 
+class AIEditIn(BaseModel):
+    action: str = Field(pattern=r"^(replace|remove)$")
+    region: str = Field(pattern=r"^[a-z0-9-]{1,40}$")
+    # Plain descriptive text only (it becomes part of an image prompt).
+    prompt: str | None = Field(default=None, min_length=3, max_length=120, pattern=r"^[A-Za-z0-9 ,.'&/()-]+$")
+
+
 class GoogleIn(BaseModel):
     credential: str = Field(min_length=20, max_length=4096)
 

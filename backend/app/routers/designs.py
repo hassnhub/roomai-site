@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 from datetime import datetime, timezone
 
 import numpy as np
@@ -12,14 +13,15 @@ from starlette.concurrency import run_in_threadpool
 
 from .. import storage
 from ..db import get_db
-from ..domain import ROOM_TYPES
-from ..schemas import DesignUpdateIn, EditsIn, PreferencesIn, PreviewIn, RenderIn, SwapIn
+from ..config import get_settings
+from ..domain import ROOM_TYPES, STYLES
+from ..schemas import AIEditIn, DesignUpdateIn, EditsIn, PreferencesIn, PreviewIn, RenderIn, SwapIn
 from ..security import current_user
 from ..services import room_editor, visualiser
 from ..services.detection import map_to_categories
 from ..services.imaging import ImageValidationError, load_upload, to_jpeg_bytes
 from ..services.pipeline import analyse_image, get_recommender, prefs_for, recommend_for
-from ..services.segmentation import overlay
+from ..services.segmentation import overlay, segment
 
 router = APIRouter(prefix="/api/designs", tags=["designs"])
 
@@ -33,6 +35,8 @@ def serialize(d: dict) -> dict:
     out["renders"] = [{**r, "created_at": r["created_at"].isoformat()} for r in d.get("renders", [])]
     if d.get("custom"):
         out["custom"] = {**d["custom"], "created_at": d["custom"]["created_at"].isoformat()}
+    if d.get("editor"):
+        out["editor"] = {"steps": [{**st, "created_at": st["created_at"].isoformat()} for st in d["editor"]["steps"]]}
     return out
 
 
@@ -252,6 +256,7 @@ def get_image(design_id: str, image_id: str, user: dict = Depends(current_user))
     allowed = {design["image_id"], *(r["image_id"] for r in design.get("renders", []))}
     if design.get("custom"):
         allowed.add(design["custom"]["image_id"])
+    allowed.update(st["image_id"] for st in _steps(design))
     if image_id not in allowed:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Image not found")
     data = storage.load_image(str(user["_id"]), image_id)
@@ -277,22 +282,45 @@ def delete_design(design_id: str, user: dict = Depends(current_user)):
     design = _get_owned(design_id, user)
     uid = str(user["_id"])
     custom = [design["custom"]["image_id"]] if design.get("custom") else []
-    for file_id in [design["image_id"], design.get("seg_id"), *(r["image_id"] for r in design.get("renders", [])), *custom]:
+    steps = [f for st in _steps(design) for f in (st["image_id"], st.get("seg_id"))]
+    for file_id in [design["image_id"], design.get("seg_id"), *(r["image_id"] for r in design.get("renders", [])), *custom, *steps]:
         if file_id:
             storage.delete_image(uid, file_id)
     get_db().designs.delete_one({"_id": design["_id"]})
     return Response(status_code=204)
 
 
-# --- Edit Room: tap a region of the photo and recolour it ----------------------------------------------
+# --- Edit Room: tap a region of the photo and recolour, replace or remove it ------------------------------
+# AI replacements and removals each produce a new version of the photo (a "step") with its own
+# segmentation; colour changes are always applied on top of the latest version.
 _REGION_CACHE: dict[tuple[str, str], tuple] = {}
+MAX_AI_STEPS = 10
+
+
+def _steps(design: dict) -> list[dict]:
+    return (design.get("editor") or {}).get("steps", [])
+
+
+def _load_base(design: dict, uid: str) -> tuple[Image.Image, np.ndarray | None]:
+    """The photo the editor works on: the latest AI step, or the original photo."""
+    steps = _steps(design)
+    if not steps:
+        return _load_inputs(design, uid)
+    last = steps[-1]
+    raw = storage.load_image(uid, last["image_id"])
+    if raw is None:
+        raise HTTPException(status.HTTP_410_GONE, "The edited photo is no longer available")
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    seg = storage.load_image(uid, last["seg_id"]) if last.get("seg_id") else None
+    return img, (np.asarray(Image.open(io.BytesIO(seg))) if seg is not None else None)
 
 
 def _regions(design: dict, uid: str):
-    """(image, index_map, regions) for a design, cached per design and segmentation."""
-    key = (str(design["_id"]), design.get("seg_id") or "")
+    """(image, index_map, regions) for the design's current photo, cached per design and version."""
+    version = _steps(design)[-1]["image_id"] if _steps(design) else design.get("seg_id") or ""
+    key = (str(design["_id"]), version)
     if key not in _REGION_CACHE:
-        img, label_map = _load_inputs(design, uid)
+        img, label_map = _load_base(design, uid)
         if label_map is None or label_map.shape != img.size[::-1]:
             raise HTTPException(status.HTTP_409_CONFLICT, "This design has no room segmentation, so it cannot be edited")
         index, regions = room_editor.build_regions(img, label_map)
@@ -307,14 +335,15 @@ def list_regions(design_id: str, user: dict = Depends(current_user)):
     design = _get_owned(design_id, user)
     _, index, regions = _regions(design, str(user["_id"]))
     h, w = index.shape
-    return {"width": w, "height": h, "regions": regions, "floor_finishes": room_editor.FLOOR_FINISHES}
+    return {"width": w, "height": h, "regions": regions, "floor_finishes": room_editor.FLOOR_FINISHES,
+            "ai": bool(get_settings().stability_api_key)}
 
 
 @router.get("/{design_id}/regions.png")
 def region_map(design_id: str, user: dict = Depends(current_user)):
     design = _get_owned(design_id, user)
     _, index, _ = _regions(design, str(user["_id"]))
-    return Response(room_editor.index_png(index), media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+    return Response(room_editor.index_png(index), media_type="image/png", headers={"Cache-Control": "private, no-cache"})
 
 
 def _edited(design: dict, uid: str, body: EditsIn) -> bytes:
@@ -327,7 +356,7 @@ def _edited(design: dict, uid: str, body: EditsIn) -> bytes:
 
 @router.post("/{design_id}/edit/preview")
 def preview_edit(design_id: str, body: EditsIn, user: dict = Depends(current_user)):
-    """Instant preview of the edits; nothing is stored."""
+    """Instant preview of the colour changes on the current photo; nothing is stored."""
     design = _get_owned(design_id, user)
     return Response(_edited(design, str(user["_id"]), body), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
@@ -337,13 +366,14 @@ def save_edit(design_id: str, body: EditsIn, user: dict = Depends(current_user))
     """Saves the edited photo with the design, replacing any earlier saved edit."""
     design = _get_owned(design_id, user)
     uid = str(user["_id"])
-    if not body.edits:
+    if not body.edits and not _steps(design):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Make at least one change before saving")
     jpeg = _edited(design, uid, body)
     if design.get("custom"):
         storage.delete_image(uid, design["custom"]["image_id"])
     now = datetime.now(timezone.utc)
-    custom = {"image_id": storage.save_image(uid, jpeg, "edit"), "edits": [e.model_dump() for e in body.edits], "created_at": now}
+    custom = {"image_id": storage.save_image(uid, jpeg, "edit"), "edits": [e.model_dump() for e in body.edits],
+              "ai_steps": len(_steps(design)), "created_at": now}
     get_db().designs.update_one({"_id": design["_id"]}, {"$set": {"custom": custom, "updated_at": now}})
     return serialize({**design, "custom": custom, "updated_at": now})
 
@@ -356,3 +386,62 @@ def delete_edit(design_id: str, user: dict = Depends(current_user)):
         get_db().designs.update_one({"_id": design["_id"]}, {"$unset": {"custom": ""}})
         design.pop("custom")
     return serialize(design)
+
+
+@router.post("/{design_id}/edit/ai")
+def ai_edit(design_id: str, body: AIEditIn, user: dict = Depends(current_user)):
+    """Replaces a piece of furniture with a described one, or removes it, using generative AI inpainting.
+    Only that piece's region is redrawn; the result is re-segmented so editing can continue on it."""
+    design = _get_owned(design_id, user)
+    uid = str(user["_id"])
+    if not get_settings().stability_api_key:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "The AI image service is not available")
+    if len(_steps(design)) >= MAX_AI_STEPS:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Up to {MAX_AI_STEPS} AI changes per design; undo one to make another")
+    if body.action == "replace" and not body.prompt:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Describe the new piece of furniture")
+    img, index, regions = _regions(design, uid)
+    region = next((r for r in regions if r["key"] == body.region), None)
+    if region is None or region["kind"] != "furniture":
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Choose a piece of furniture to replace or remove")
+    prompt = None
+    if body.action == "replace":
+        prompt = room_editor.replace_prompt(body.prompt, STYLES[design["preferences"]["style"]]["label"],
+                                            ROOM_TYPES[design["room_type"]])
+    try:
+        result = room_editor.ai_edit(img, index == region["index"], body.action, prompt)
+    except visualiser.VisualisationError as exc:
+        logging.getLogger(__name__).warning("AI edit failed: %s", exc)
+        message = ("The AI image service has run out of credits, so this change could not be made."
+                   if " 402" in str(exc) else "The AI image service could not make this change right now. Please try again later.")
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, message)
+    label_map = segment(result)
+    if label_map is None:  # segmenter unavailable: keep the previous layout
+        label_map = _load_base(design, uid)[1]
+    now = datetime.now(timezone.utc)
+    step = {"action": body.action, "region": region["key"], "label": region["label"], "prompt": body.prompt,
+            "image_id": storage.save_image(uid, to_jpeg_bytes(result), "aiedit"),
+            "seg_id": _save_label_map(uid, label_map), "created_at": now}
+    steps = [*_steps(design), step]
+    get_db().designs.update_one({"_id": design["_id"]}, {"$set": {"editor": {"steps": steps}, "updated_at": now}})
+    return serialize({**design, "editor": {"steps": steps}, "updated_at": now})
+
+
+@router.post("/{design_id}/edit/ai/undo")
+def undo_ai_edit(design_id: str, user: dict = Depends(current_user)):
+    design = _get_owned(design_id, user)
+    steps = _steps(design)
+    if not steps:
+        raise HTTPException(status.HTTP_409_CONFLICT, "There is no AI change to undo")
+    for file_id in (steps[-1]["image_id"], steps[-1].get("seg_id")):
+        if file_id:
+            storage.delete_image(str(user["_id"]), file_id)
+    steps = steps[:-1]
+    now = datetime.now(timezone.utc)
+    if steps:
+        get_db().designs.update_one({"_id": design["_id"]}, {"$set": {"editor": {"steps": steps}, "updated_at": now}})
+        design["editor"] = {"steps": steps}
+    else:
+        get_db().designs.update_one({"_id": design["_id"]}, {"$unset": {"editor": ""}, "$set": {"updated_at": now}})
+        design.pop("editor", None)
+    return serialize({**design, "updated_at": now})

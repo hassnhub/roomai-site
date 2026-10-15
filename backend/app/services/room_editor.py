@@ -99,6 +99,64 @@ def apply_edits(image: Image.Image, index: np.ndarray, regions: list[dict], edit
     return to_jpeg_bytes(Image.fromarray(lab_to_rgb(lab).astype(np.uint8), "RGB"), quality=92)
 
 
+# --- Replace or remove a piece of furniture with generative AI ------------------------------------
+NEGATIVE = ("people, person, text, watermark, logo, blurry, distorted, deformed, warped perspective, "
+            "low quality, cartoon, illustration, duplicate furniture")
+
+
+def replace_prompt(description: str, style_label: str, room_label: str) -> str:
+    return (f"{description}, {style_label} style, in a {room_label.lower()}, photorealistic interior photograph, "
+            f"natural light, matching the room's perspective, lighting and shadows, high detail")
+
+
+def _ai_mask(mask: np.ndarray) -> np.ndarray:
+    """The region plus a small margin, so the old piece's outline does not survive at the edges."""
+    return ndimage.binary_dilation(mask, iterations=3)
+
+
+def _stability_edit(service: str, image: Image.Image, mask: np.ndarray, data: dict) -> bytes:
+    import io
+
+    import httpx
+
+    from ..config import get_settings
+    from .visualiser import VisualisationError
+
+    key = get_settings().stability_api_key
+    if not key:
+        raise VisualisationError("The AI image service is not configured")
+    buf = io.BytesIO()
+    Image.fromarray((mask * 255).astype(np.uint8), "L").save(buf, format="PNG")
+    resp = httpx.post(
+        f"https://api.stability.ai/v2beta/stable-image/edit/{service}",
+        headers={"Authorization": f"Bearer {key}", "Accept": "image/*"},
+        files={"image": ("room.jpg", to_jpeg_bytes(image), "image/jpeg"), "mask": ("mask.png", buf.getvalue(), "image/png")},
+        data={**data, "output_format": "jpeg"},
+        timeout=120,
+    )
+    if resp.status_code != 200:
+        raise VisualisationError(f"Stability API {resp.status_code}: {resp.text[:200]}")
+    return resp.content
+
+
+def ai_edit(image: Image.Image, mask: np.ndarray, action: str, prompt: str | None = None) -> Image.Image:
+    """Redraws only the masked region: 'replace' paints new furniture from the prompt, 'remove' erases it.
+    The result is returned at the original size so region maps and later edits stay aligned."""
+    import io
+
+    if action == "replace":
+        data = {"prompt": prompt, "negative_prompt": NEGATIVE, "grow_mask": "8"}
+        raw = _stability_edit("inpaint", image, _ai_mask(mask), data)
+    elif action == "remove":
+        raw = _stability_edit("erase", image, _ai_mask(mask), {"grow_mask": "8"})
+    else:
+        raise EditError(f"Unknown AI action: {action}")
+    result = Image.open(io.BytesIO(raw)).convert("RGB")
+    if result.size != image.size:
+        result = result.resize(image.size, Image.LANCZOS)
+    return result
+
+
 def index_png(index: np.ndarray) -> bytes:
     """The region map as a lossless greyscale PNG: pixel value = region number (0 = not editable)."""
     import io
