@@ -1,6 +1,8 @@
 """Room visualisation: generates an image of the redesigned room.
 
 Providers (selected by the VISUALISER setting, or automatically in "auto" mode):
+  * gemini     - Google Gemini image editing: the model sees the real photo and changes only what the
+                 prompt lists, so walls, windows, light and camera angle are kept as they are.
   * stability  - Stability AI "Structure" control: diffusion guided by the edges/structure of
                  the original photo, so walls, windows and layout are preserved.
   * replicate  - an interior-design ControlNet model hosted on Replicate.
@@ -33,6 +35,8 @@ def active_provider() -> str:
     s = get_settings()
     if s.visualiser != "auto":
         return s.visualiser
+    if s.gemini_api_key:
+        return "gemini"
     if s.stability_api_key:
         return "stability"
     if s.replicate_api_token:
@@ -40,16 +44,47 @@ def active_provider() -> str:
     return "local"
 
 
+# A named wall paint per scheme: image models follow "walls painted powder blue (#A7C4D8)" far better
+# than "cool blues & greys colour palette".
+WALL_PAINT = {
+    "neutral": ("warm greige", "#D9CFC1"),
+    "warm": ("soft apricot", "#F2D0A4"),
+    "cool": ("powder blue", "#A7C4D8"),
+    "earthy": ("sage green", "#B7B58E"),
+    "monochrome": ("light grey", "#CCCCCC"),
+    "pastel": ("pale mint", "#CDE7DD"),
+    "bold": ("deep navy", "#1F4E79"),
+}
+
+# Concrete materials and forms per style, so the result looks like that style rather than a generic room.
+STYLE_CUES = {
+    "modern": "clean lines, matte lacquer and glass, slim black metal details, one bold accent colour",
+    "scandinavian": "light ash and white oak, wool and linen textiles, rounded simple forms, uncluttered",
+    "industrial": "black steel frames, reclaimed timber, cognac leather, exposed-bulb lighting",
+    "bohemian": "rattan and jute, layered patterned rugs and cushions, macrame, many green plants",
+    "minimalist": "very few pieces, hidden storage, plain surfaces, calm neutral tones",
+    "traditional": "rich dark wood, symmetrical layout, rolled-arm upholstery, brass lamps, framed art",
+    "mid_century": "walnut, tapered legs, organic curves, mustard and teal accents, globe lights",
+    "japandi": "low furniture, pale oak, matte ceramics, paper lantern, muted earth tones",
+    "coastal": "white and sandy linen, light washed wood, soft blue accents, woven textures",
+}
+
+
 def build_prompt(room_type: str, style: str, scheme: str, items: list[dict]) -> tuple[str, str]:
-    scheme_label = COLOUR_SCHEMES[scheme]["label"].lower()
-    key_items = ", ".join(
-        f"{i['colour_name'].lower()} {i['material']} {CATEGORIES[i['category']].lower()}" for i in items[:6]
+    wall_name, wall_hex = WALL_PAINT.get(scheme, WALL_PAINT["neutral"])
+    key_items = "\n".join(
+        f"- {i['colour_name'].lower()} {i['material']} {CATEGORIES[i['category']].lower()}" for i in items[:6]
     )
     prompt = (
-        f"The same {ROOM_TYPES[room_type].lower()} completely refurnished in {STYLES[style]['label']} style "
-        f"with all-new furniture and décor: {key_items}. {scheme_label.capitalize()} colour palette on the walls "
-        f"and soft furnishings. Same walls, windows, doors and camera angle. Photorealistic interior design "
-        f"photography, natural daylight, balanced composition, high detail, magazine quality."
+        f"Edit this photo: the same {ROOM_TYPES[room_type].lower()} refurnished in {STYLES[style]['label']} style "
+        f"with all-new furniture and décor.\n"
+        f"Same walls, windows, doors and camera angle. Keep the room's shape, ceiling and the direction of the "
+        f"existing light exactly as in the photo.\n"
+        f"Change only:\n"
+        f"- Walls: painted {wall_name} ({wall_hex}), matt finish.\n"
+        f"- Remove the current furniture and furnish the room with:\n{key_items}\n"
+        f"Style: {STYLE_CUES.get(style, STYLES[style]['description'])}.\n"
+        f"The result must look like a real photograph of this same room."
     )
     negative = ("people, text, watermark, blurry, distorted furniture, cluttered, low quality, cartoon, deformed, "
                 "old worn furniture, mess, extra windows, warped walls")
@@ -64,6 +99,8 @@ def render(image: Image.Image, room_type: str, style: str, scheme: str, option: 
     prompt, negative = build_prompt(room_type, style, scheme, option["items"])
     provider = provider or active_provider()
     try:
+        if provider == "gemini":
+            return _gemini(image, prompt), "gemini", prompt
         if provider == "stability":
             return _stability(image, prompt, negative), "stability", prompt
         if provider == "replicate":
@@ -71,6 +108,35 @@ def render(image: Image.Image, room_type: str, style: str, scheme: str, option: 
     except Exception as exc:
         log.warning("%s visualisation failed, using local preview: %s", provider, exc)
     return realistic_render(image, label_map, style, scheme, option, detections), "local", prompt
+
+
+# --- Google Gemini ---------------------------------------------------------------------------
+def _gemini(image: Image.Image, prompt: str) -> bytes:
+    s = get_settings()
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="PNG")  # lossless, so the model sees the photo's real texture
+    resp = httpx.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{s.gemini_image_model}:generateContent",
+        headers={"x-goog-api-key": s.gemini_api_key},
+        json={
+            "contents": [{"parts": [
+                {"inline_data": {"mime_type": "image/png", "data": base64.b64encode(buf.getvalue()).decode()}},
+                {"text": prompt},
+            ]}],
+            "generationConfig": {"responseModalities": ["IMAGE"]},
+        },
+        timeout=120,
+    )
+    if resp.status_code != 200:
+        raise VisualisationError(f"Gemini API {resp.status_code}: {resp.text[:200]}")
+    for candidate in resp.json().get("candidates", []):
+        for part in candidate.get("content", {}).get("parts", []):
+            data = part.get("inlineData") or part.get("inline_data")
+            if data:
+                # Stored renders are JPEG; keep quality high so the AI detail survives.
+                out = Image.open(io.BytesIO(base64.b64decode(data["data"])))
+                return to_jpeg_bytes(out, quality=95)
+    raise VisualisationError("Gemini API returned no image")
 
 
 # --- Stability AI ------------------------------------------------------------------------
