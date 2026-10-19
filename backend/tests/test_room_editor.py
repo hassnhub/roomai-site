@@ -173,3 +173,41 @@ def test_ai_failure_gives_a_friendly_message(client, room_image_bytes, monkeypat
     piece = _furniture(client, h, d)
     r = client.post(f"/api/designs/{d['id']}/edit/ai", headers=h, json={"action": "remove", "region": piece["key"]})
     assert r.status_code == 502 and "run out of credits" in r.json()["detail"] and "{" not in r.json()["detail"]
+
+
+def test_paint_with_ai_repaints_walls_and_can_be_undone(client, room_image_bytes, monkeypatch):
+    calls = []
+
+    def stand_in(image, select_prompt, prompt):
+        calls.append({"select": select_prompt, "prompt": prompt})
+        buf = io.BytesIO()
+        Image.new("RGB", image.size, (79, 124, 172)).save(buf, format="JPEG")
+        return buf.getvalue()
+
+    monkeypatch.setattr(get_settings(), "stability_api_key", "test-key")
+    monkeypatch.setattr(room_editor, "_stability_recolor", stand_in)
+    h, d = _design(client, room_image_bytes)
+    url = f"/api/designs/{d['id']}/edit/ai"
+    assert client.post(url, headers=h, json={"action": "paint", "region": "walls"}).status_code == 422       # no colour
+    assert client.post(url, headers=h, json={"action": "paint", "region": "nowhere", "colour": "#4F7CAC"}).status_code == 422
+    assert client.post(url, headers=h, json={"action": "paint", "region": "walls", "colour": "blue"}).status_code == 422
+    assert not calls
+    r = client.post(url, headers=h, json={"action": "paint", "region": "walls", "colour": "#4F7CAC"})
+    assert r.status_code == 200, r.text
+    step = r.json()["editor"]["steps"][0]
+    assert step["action"] == "paint" and step["region"] == "walls" and "#4F7CAC" in step["prompt"]
+    assert calls[0]["select"] == "the painted walls" and "#4F7CAC" in calls[0]["prompt"]
+    assert client.get(f"/api/designs/{d['id']}/images/{step['image_id']}", headers=h).status_code == 200
+    assert "editor" not in client.post(f"{url}/undo", headers=h).json()
+
+
+def test_paint_description_uses_colour_words():
+    assert room_editor.paint_description("#4F7CAC").endswith("(#4F7CAC)")
+    assert room_editor.paint_description("#F5F1EA").startswith("pale ")
+    assert room_editor.paint_description("#1F1D1B").startswith("deep ")
+
+
+def test_paint_targets_describe_each_part_of_the_room():
+    assert room_editor.paint_target({"key": "walls", "label": "Walls"}) == "the painted walls"
+    assert room_editor.paint_target({"key": "floor", "label": "Floor"}) == "the floor"
+    assert room_editor.paint_target({"key": "table-2", "label": "Table 2"}) == "the table"
