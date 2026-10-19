@@ -12,6 +12,8 @@ import sys
 # The server runs the app with HF_HUB_OFFLINE=1; this script is the one place that must go online.
 os.environ["HF_HUB_OFFLINE"] = "0"
 os.environ["TRANSFORMERS_OFFLINE"] = "0"
+# The newer "xet" downloader reserves a lot of memory and fails on shared hosting; use plain HTTP downloads.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
