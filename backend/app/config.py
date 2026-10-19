@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     yolo_model: str = "yolov8n.pt"
     detection_confidence: float = 0.35
 
-    # Visualisation provider: "auto" | "gemini" | "stability" | "replicate" | "local"
+    # Visualisation provider: "auto" | "stability" | "replicate" | "local"
     visualiser: str = "auto"
     stability_api_key: str = ""
     # How closely the AI redesign follows the photo's structure (0-1). 0.65 keeps walls, windows and
@@ -53,10 +53,6 @@ class Settings(BaseSettings):
     stability_control_strength: float = 0.65
     replicate_api_token: str = ""
     replicate_model: str = "adirik/interior-design"
-    # Google Gemini image editing ("Nano Banana"). Edits the real photo, so walls, windows and light are kept.
-    # Preferred over Stability and Replicate when a key is set. Model name from Google AI Studio.
-    gemini_api_key: str = ""
-    gemini_image_model: str = "gemini-2.5-flash-image"
 
     # Google Sign-In (OAuth client ID from Google Cloud Console). Leave blank to hide the option.
     google_client_id: str = ""
