@@ -390,8 +390,8 @@ def delete_edit(design_id: str, user: dict = Depends(current_user)):
 
 @router.post("/{design_id}/edit/ai")
 def ai_edit(design_id: str, body: AIEditIn, user: dict = Depends(current_user)):
-    """Replaces a piece of furniture with a described one, or removes it, using generative AI inpainting.
-    Only that piece's region is redrawn; the result is re-segmented so editing can continue on it."""
+    """Replaces a piece of furniture with a described one, removes it, or paints the walls or ceiling, using
+    generative AI. The result is re-segmented so editing can continue on it."""
     design = _get_owned(design_id, user)
     uid = str(user["_id"])
     if not get_settings().stability_api_key:
@@ -400,16 +400,24 @@ def ai_edit(design_id: str, body: AIEditIn, user: dict = Depends(current_user)):
         raise HTTPException(status.HTTP_409_CONFLICT, f"Up to {MAX_AI_STEPS} AI changes per design; undo one to make another")
     if body.action == "replace" and not body.prompt:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Describe the new piece of furniture")
+    if body.action == "paint" and not body.colour:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Choose a colour to paint")
     img, index, regions = _regions(design, uid)
     region = next((r for r in regions if r["key"] == body.region), None)
-    if region is None or region["kind"] != "furniture":
+    if body.action == "paint":
+        if region is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Choose a part of the room to paint")
+    elif region is None or region["kind"] != "furniture":
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Choose a piece of furniture to replace or remove")
     prompt = None
     if body.action == "replace":
         prompt = room_editor.replace_prompt(body.prompt, STYLES[design["preferences"]["style"]]["label"],
                                             ROOM_TYPES[design["room_type"]])
     try:
-        result = room_editor.ai_edit(img, index == region["index"], body.action, prompt)
+        if body.action == "paint":
+            result = room_editor.ai_paint(img, region, body.colour)
+        else:
+            result = room_editor.ai_edit(img, index == region["index"], body.action, prompt)
     except visualiser.VisualisationError as exc:
         logging.getLogger(__name__).warning("AI edit failed: %s", exc)
         message = ("The AI image service has run out of credits, so this change could not be made."
@@ -419,7 +427,8 @@ def ai_edit(design_id: str, body: AIEditIn, user: dict = Depends(current_user)):
     if label_map is None:  # segmenter unavailable: keep the previous layout
         label_map = _load_base(design, uid)[1]
     now = datetime.now(timezone.utc)
-    step = {"action": body.action, "region": region["key"], "label": region["label"], "prompt": body.prompt,
+    described = room_editor.paint_description(body.colour) if body.action == "paint" else body.prompt
+    step = {"action": body.action, "region": region["key"], "label": region["label"], "prompt": described,
             "image_id": storage.save_image(uid, to_jpeg_bytes(result), "aiedit"),
             "seg_id": _save_label_map(uid, label_map), "created_at": now}
     steps = [*_steps(design), step]
