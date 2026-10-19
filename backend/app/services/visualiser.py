@@ -201,7 +201,7 @@ def _wall_mask(lab: np.ndarray, label_map: np.ndarray) -> np.ndarray:
 
     Strongly coloured walls (e.g. orange) tint their window reveals and frames, so those are grown into
     pixel by pixel. Light walls are handled per region instead: a small region the segmenter labelled as a
-    window, curtain or picture that mostly looks like the wall (typically a sunlit or shaded strip of
+    window or curtain that mostly looks like the wall (typically a sunlit or shaded strip of
     wall) becomes wall as a whole, while real blinds and windows are left alone as a whole - painting
     part of a region produces patches."""
     from scipy import ndimage
@@ -220,7 +220,9 @@ def _wall_mask(lab: np.ndarray, label_map: np.ndarray) -> np.ndarray:
     light = lab[..., 0]
     rough = np.abs(np.diff(light, axis=0, prepend=light[:1])) + np.abs(np.diff(light, axis=1, prepend=light[:, :1]))
     wall_rough = rough[base].mean()
-    regions, n = ndimage.label(np.isin(label_map, (0, 4, 5, 12, 15)) & ~walls)
+    # Pictures and posters (15) are never absorbed: a light poster on a light wall looks "wall-like" but must
+    # keep its own colours when the wall is repainted.
+    regions, n = ndimage.label(np.isin(label_map, (0, 4, 5, 12)) & ~walls)
     small, larger = label_map.size * 0.025, label_map.size * 0.05
     for i in range(1, n + 1):
         region = regions == i

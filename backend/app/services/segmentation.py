@@ -19,8 +19,15 @@ from .colours import colour_name, lab_to_rgb, rgb_to_hex, rgb_to_lab
 
 log = logging.getLogger(__name__)
 
-MODEL_ID = "nvidia/segformer-b0-finetuned-ade-512-512"
-LOCAL_DIR = BASE_DIR / "models" / "segformer"
+# Mask2Former (Swin-Small, ADE20K). Compared on real rooms with SegFormer B0/B2/B5, OneFormer and the larger
+# Mask2Former models, it was the only small model that kept posters, pictures and the shadow under a desk out
+# of the wall, with tight edges, and it needs no more memory than SegFormer-B2 on a CPU.
+MODEL_ID = "facebook/mask2former-swin-small-ade-semantic"
+LOCAL_DIR = BASE_DIR / "models" / "mask2former-small"
+# The earlier SegFormer-B0 bundle, used if the new weights have not been downloaded onto a server yet, so the
+# app keeps working (with the smaller model) instead of losing room analysis.
+FALLBACK_DIR = BASE_DIR / "models" / "segformer"
+INPUT_SIZE = 768  # longer side fed to the model; larger keeps more detail at wall edges
 
 # Simplified class ids stored in the label map.
 CLASSES = {
@@ -60,12 +67,16 @@ def _load():
         if _model is None and _error is None:
             try:
                 import torch  # noqa: F401
-                from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+                from transformers import (AutoConfig, AutoImageProcessor, Mask2FormerForUniversalSegmentation,
+                                          SegformerForSemanticSegmentation)
 
                 # Prefer a bundled copy (scripts/download_models.py) so servers need no internet access.
-                source = str(LOCAL_DIR) if (LOCAL_DIR / "config.json").exists() else MODEL_ID
-                _processor = SegformerImageProcessor.from_pretrained(source)
-                model = SegformerForSemanticSegmentation.from_pretrained(source)
+                bundled = [d for d in (LOCAL_DIR, FALLBACK_DIR) if (d / "config.json").exists()]
+                source = str(bundled[0]) if bundled else MODEL_ID
+                is_mask2former = AutoConfig.from_pretrained(source).model_type == "mask2former"
+                _processor = AutoImageProcessor.from_pretrained(source)
+                model_class = Mask2FormerForUniversalSegmentation if is_mask2former else SegformerForSemanticSegmentation
+                model = model_class.from_pretrained(source)
                 model.eval()
                 lut = np.zeros(len(model.config.id2label), dtype=np.uint8)
                 for idx, name in model.config.id2label.items():
@@ -75,7 +86,7 @@ def _load():
                             lut[int(idx)] = cls
                             break
                 _lut, _model = lut, model
-                log.info("Loaded segmentation model %s", MODEL_ID)
+                log.info("Loaded segmentation model from %s", source)
             except Exception as exc:
                 _error = f"{type(exc).__name__}: {exc}"
                 log.warning("Room segmentation unavailable: %s", _error)
@@ -94,12 +105,15 @@ def segment(img: Image.Image) -> np.ndarray | None:
     import torch
 
     small = img.convert("RGB").copy()
-    small.thumbnail((640, 640))
+    small.thumbnail((INPUT_SIZE, INPUT_SIZE))
     inputs = _processor(images=small, return_tensors="pt")
     with torch.no_grad():
-        logits = model(**inputs).logits
-    up = torch.nn.functional.interpolate(logits, size=img.size[::-1], mode="bilinear", align_corners=False)
-    ade = up.argmax(1)[0].numpy()
+        outputs = model(**inputs)
+    if model.config.model_type == "mask2former":
+        ade = _processor.post_process_semantic_segmentation(outputs, target_sizes=[img.size[::-1]])[0].numpy()
+    else:
+        up = torch.nn.functional.interpolate(outputs.logits, size=img.size[::-1], mode="bilinear", align_corners=False)
+        ade = up.argmax(1)[0].numpy()
     return _lut[ade]
 
 

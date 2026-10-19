@@ -11,7 +11,7 @@ from PIL import Image
 from scipy import ndimage
 
 from ..domain import STYLE_FLOORS
-from .colours import lab_to_rgb, rgb_to_lab
+from .colours import colour_name, hex_to_rgb, lab_to_rgb, rgb_to_lab
 from .imaging import to_jpeg_bytes
 from .visualiser import _floor_mask, _grow, _recolour, _wall_mask
 
@@ -151,6 +151,74 @@ def ai_edit(image: Image.Image, mask: np.ndarray, action: str, prompt: str | Non
         raw = _stability_edit("erase", image, _ai_mask(mask), {"grow_mask": "8"})
     else:
         raise EditError(f"Unknown AI action: {action}")
+    result = Image.open(io.BytesIO(raw)).convert("RGB")
+    if result.size != image.size:
+        result = result.resize(image.size, Image.LANCZOS)
+    return result
+
+
+# --- Paint walls or the ceiling with generative AI ---------------------------------------------------
+# Stability's search-and-recolor finds the surface itself from a description, so it covers the whole wall
+# and leaves posters, frames and furniture alone - unlike a mask from the small segmentation model.
+PAINT_TARGETS = {"walls": "the painted walls", "ceiling": "the ceiling", "floor": "the floor"}
+PAINT_NEGATIVE = ("pictures changed, posters changed, frames changed, furniture changed, objects changed, "
+                  "new objects, text, blurry, distorted")
+
+
+def paint_description(colour_hex: str) -> str:
+    """A paint name an image model understands, e.g. 'pale sage (#CDE7DD)'. Models follow colour words far
+    better than hex codes, so the hex is only a hint."""
+    lightness = float(rgb_to_lab(np.array(hex_to_rgb(colour_hex), dtype=np.float64))[0])
+    shade = "pale " if lightness > 82 else "deep " if lightness < 40 else ""
+    return f"{shade}{colour_name(colour_hex).lower()} ({colour_hex.upper()})"
+
+
+def _stability_recolor(image: Image.Image, select_prompt: str, prompt: str) -> bytes:
+    import io
+
+    import httpx
+
+    from ..config import get_settings
+    from .visualiser import VisualisationError
+
+    key = get_settings().stability_api_key
+    if not key:
+        raise VisualisationError("The AI image service is not configured")
+    resp = httpx.post(
+        "https://api.stability.ai/v2beta/stable-image/edit/search-and-recolor",
+        headers={"Authorization": f"Bearer {key}", "Accept": "image/*"},
+        files={"image": ("room.jpg", to_jpeg_bytes(image, quality=95), "image/jpeg")},
+        data={"select_prompt": select_prompt, "prompt": prompt, "negative_prompt": PAINT_NEGATIVE,
+              "grow_mask": "3", "output_format": "jpeg"},
+        timeout=120,
+    )
+    if resp.status_code != 200:
+        raise VisualisationError(f"Stability API {resp.status_code}: {resp.text[:200]}")
+    return resp.content
+
+
+def paint_target(region: dict) -> str:
+    """What the AI should look for: 'the painted walls', 'the floor', or a piece of furniture ('the table')."""
+    if region["key"] in PAINT_TARGETS:
+        return PAINT_TARGETS[region["key"]]
+    return "the " + region["label"].rstrip("0123456789 ").lower()
+
+
+def ai_paint(image: Image.Image, region: dict, colour_hex: str) -> Image.Image:
+    """Recolours one part of the room - walls, ceiling, floor or a piece of furniture - keeping the photo's own
+    light, shadows and material texture."""
+    import io
+
+    target = paint_target(region)
+    colour = paint_description(colour_hex)
+    if region["key"] in ("walls", "ceiling"):
+        look = f"{target} painted in {colour}, smooth matte paint"
+    elif region["key"] == "floor":
+        look = f"{target} in a {colour} finish, same material and texture"
+    else:
+        look = f"{target} in {colour}, same shape, material and texture"
+    prompt = f"{look}, same lighting and shadows as the photo, realistic interior photograph"
+    raw = _stability_recolor(image, target, prompt)
     result = Image.open(io.BytesIO(raw)).convert("RGB")
     if result.size != image.size:
         result = result.resize(image.size, Image.LANCZOS)
