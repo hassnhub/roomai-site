@@ -107,10 +107,12 @@ class EditsIn(BaseModel):
 
 
 class AIEditIn(BaseModel):
-    action: str = Field(pattern=r"^(replace|remove)$")
+    action: str = Field(pattern=r"^(replace|remove|paint)$")
     region: str = Field(pattern=r"^[a-z0-9-]{1,40}$")
     # Plain descriptive text only (it becomes part of an image prompt).
     prompt: str | None = Field(default=None, min_length=3, max_length=120, pattern=r"^[A-Za-z0-9 ,.'&/()-]+$")
+    # Paint colour for action "paint" (walls or ceiling).
+    colour: str | None = Field(default=None, pattern=r"^#[0-9A-Fa-f]{6}$")
 
 
 class GoogleIn(BaseModel):
