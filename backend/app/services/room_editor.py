@@ -13,7 +13,7 @@ from scipy import ndimage
 from ..domain import STYLE_FLOORS
 from .colours import lab_to_rgb, rgb_to_lab
 from .imaging import to_jpeg_bytes
-from .visualiser import _floor_mask, _grow, _paint, _recolour, _soft_mask, _wall_mask
+from .visualiser import _floor_mask, _grow, _recolour, _wall_mask
 
 FURNITURE = {6: "Sofa", 7: "Bed", 8: "Chair", 9: "Table", 10: "Cabinet", 11: "Rug", 12: "Curtains"}
 MIN_AREA = 0.004          # regions smaller than 0.4% of the photo are too small to tap reliably
@@ -91,20 +91,11 @@ def apply_edits(image: Image.Image, index: np.ndarray, regions: list[dict], edit
         if edit["region"] not in by_key:
             raise EditError(f"Unknown region: {edit['region']}")
         final[edit["region"]] = edit["colour"]
-    original = rgb_to_lab(np.asarray(image.convert("RGB"), dtype=np.float64))
-    lab = original.copy()
+    lab = rgb_to_lab(np.asarray(image.convert("RGB"), dtype=np.float64))
     for key, colour in final.items():
         region = by_key[key]
-        mask = index == region["index"]
-        # Segmentation runs on a reduced copy, so its outline is a few pixels off the real edges. Snap it
-        # to the photo's own edges, measured on the unedited photo, so no strip of old colour survives
-        # around pictures and frames and paint does not spill onto furniture.
-        alpha = _soft_mask(original, mask)
-        if key in ("walls", "ceiling"):
-            lab = _paint(lab, original, alpha, colour)
-        else:
-            texture, chroma, strength = PAINT.get(key, PAINT["furniture"]) if region["kind"] == "surface" else PAINT["furniture"]
-            lab = _recolour(lab, mask, colour, texture=texture, chroma=chroma, strength=strength, alpha=alpha)
+        texture, chroma, strength = PAINT.get(key, PAINT["furniture"]) if region["kind"] == "surface" else PAINT["furniture"]
+        lab = _recolour(lab, index == region["index"], colour, texture=texture, chroma=chroma, strength=strength)
     return to_jpeg_bytes(Image.fromarray(lab_to_rgb(lab).astype(np.uint8), "RGB"), quality=92)
 
 

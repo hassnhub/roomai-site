@@ -320,8 +320,7 @@ def _floor_mask(lab: np.ndarray, label_map: np.ndarray) -> np.ndarray:
     return floor | reclaimed
 
 
-def _recolour(lab: np.ndarray, mask: np.ndarray, target_hex: str, texture: float, chroma: float, strength: float = 1.0,
-              alpha: np.ndarray | None = None):
+def _recolour(lab: np.ndarray, mask: np.ndarray, target_hex: str, texture: float, chroma: float, strength: float = 1.0):
     """Repaint a region: move it to the target colour while keeping its own shading and texture."""
     if mask.sum() < 64:
         return lab
@@ -330,62 +329,8 @@ def _recolour(lab: np.ndarray, mask: np.ndarray, target_hex: str, texture: float
     new = np.empty_like(lab)
     new[..., 0] = np.clip(target[0] + (lab[..., 0] - mean[0]) * texture, 0, 100)
     new[..., 1:] = target[1:] + (lab[..., 1:] - mean[1:]) * chroma
-    alpha = (_feather(mask) if alpha is None else alpha)[..., None] * strength
+    alpha = _feather(mask)[..., None] * strength
     return lab * (1 - alpha) + new * alpha
-
-
-def _guided_filter(guide: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
-    """Edge-preserving filter (He, Sun and Tang, 2013): smooths src but keeps the edges present in guide."""
-    from scipy import ndimage
-
-    mean = lambda x: ndimage.uniform_filter(x, size=2 * radius + 1, mode="reflect")
-    mi, mp = mean(guide), mean(src)
-    a = (mean(guide * src) - mi * mp) / (mean(guide * guide) - mi * mi + eps)
-    b = mp - a * mi
-    return mean(a) * guide + mean(b)
-
-
-def _soft_mask(lab: np.ndarray, mask: np.ndarray, band: int = 6) -> np.ndarray:
-    """Turn a coarse 0/1 region into a soft mask whose edges follow the photo's real edges.
-
-    The guide is each pixel's similarity to the region's own colour, so within a narrow band around the
-    outline, pixels that look like the region join it and pixels that look like a picture frame or a desk
-    leave it. Outside the band nothing changes, so a region can never spread across the room."""
-    from scipy import ndimage
-
-    if mask.sum() < 64:
-        return mask.astype(np.float64)
-    core = ndimage.binary_erosion(mask, iterations=band)
-    ref = lab[core if core.sum() >= 64 else mask]
-    mean_ab, mean_l = ref[:, 1:].mean(0), np.median(ref[:, 0])
-    # Hue matters most (shading changes lightness across a wall), lightness a little.
-    dist = np.sqrt(((lab[..., 1:] - mean_ab) ** 2).sum(-1) + (0.2 * (lab[..., 0] - mean_l)) ** 2)
-    guide = np.exp(-dist / 25.0)
-    soft = np.clip(_guided_filter(guide, mask.astype(np.float64), radius=4, eps=1e-4), 0, 1)
-    soft = np.clip((soft - 0.5) * 3.0 + 0.5, 0, 1)  # firm up the edge so paint does not look see-through
-    soft[core] = 1.0
-    soft[~ndimage.binary_dilation(mask, iterations=band)] = 0.0
-    return ndimage.gaussian_filter(soft, 0.6)
-
-
-def _paint(lab: np.ndarray, original: np.ndarray, alpha: np.ndarray, target_hex: str) -> np.ndarray:
-    """Paint a wall or ceiling the way real paint behaves: the colour is the paint's own colour where the
-    surface is lit, and gets darker and less saturated in shadow by the same ratio as the original photo."""
-    sel = alpha > 0.5
-    if sel.sum() < 64:
-        return lab
-    target = rgb_to_lab(np.array(hex_to_rgb(target_hex), dtype=np.float64))
-    lit = np.percentile(original[sel][:, 0], 85)  # the surface's well-lit level
-    # A dim photo makes every surface darker than its real colour; apply part of that so paint matches.
-    exposure = np.clip(lit / 85.0, 0.75, 1.0)
-    shade = np.clip(original[..., 0] / max(lit, 1.0), 0.15, 1.12) * exposure
-    new = np.empty_like(lab)
-    new[..., 0] = np.clip(target[0] * shade, 0, 100)
-    # Shadows lose saturation; keep a trace of the wall's own texture so it does not look like flat fill.
-    texture = original[..., 1:] - original[sel][:, 1:].mean(0)
-    new[..., 1:] = target[1:] * np.clip(shade, 0.35, 1.0)[..., None] ** 0.6 + texture * 0.12
-    a = alpha[..., None]
-    return lab * (1 - a) + new * a
 
 
 def _furniture_masks(label_map: np.ndarray, option: dict, detections: list[dict]) -> list[tuple[np.ndarray, str]]:
