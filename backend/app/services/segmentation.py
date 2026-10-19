@@ -109,11 +109,14 @@ def segment(img: Image.Image) -> np.ndarray | None:
     inputs = _processor(images=small, return_tensors="pt")
     with torch.no_grad():
         outputs = model(**inputs)
+    # Decide each pixel's class at the model's working size, then enlarge only the final label map. Enlarging
+    # the per-class scores to full size first needs about 700 MB more memory, too much for shared hosting.
     if model.config.model_type == "mask2former":
-        ade = _processor.post_process_semantic_segmentation(outputs, target_sizes=[img.size[::-1]])[0].numpy()
+        ade = _processor.post_process_semantic_segmentation(outputs, target_sizes=[small.size[::-1]])[0].numpy()
     else:
-        up = torch.nn.functional.interpolate(outputs.logits, size=img.size[::-1], mode="bilinear", align_corners=False)
+        up = torch.nn.functional.interpolate(outputs.logits, size=small.size[::-1], mode="bilinear", align_corners=False)
         ade = up.argmax(1)[0].numpy()
+    ade = np.asarray(Image.fromarray(ade.astype(np.uint8)).resize(img.size, Image.NEAREST))
     return _lut[ade]
 
 
